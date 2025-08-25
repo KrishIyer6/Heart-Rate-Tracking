@@ -1,13 +1,14 @@
 from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_bcrypt import Bcrypt
 from flask_cors import CORS
+from flask_migrate import Migrate
 from datetime import datetime, timedelta
 import os
-from functools import wraps
 import re
-from flask_migrate import Migrate
+from config import config
+from models import db, User, BloodPressureReading
+from models.user import bcrypt as user_bcrypt
 
 app = Flask(__name__)
 
@@ -26,85 +27,12 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize extensions
-db = SQLAlchemy(app)
+db.init_app(app)
 jwt = JWTManager(app)
 bcrypt = Bcrypt(app)
+user_bcrypt.init_app(app)  # Initialize the bcrypt instance in user model
 CORS(app)
 migrate = Migrate(app, db)
-
-class User(db.Model):
-    __tablename__ = 'users'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(128), nullable=False)
-    first_name = db.Column(db.String(50), nullable=True)
-    last_name = db.Column(db.String(50), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    readings = db.relationship('BloodPressureReading', backref='user', lazy=True, cascade='all, delete-orphan')
-    
-    def set_password(self, password):
-        """Hash and set password"""
-        self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
-    
-    def check_password(self, password):
-        """Check if password matches hash"""
-        return bcrypt.check_password_hash(self.password_hash, password)
-    
-    def to_dict(self):
-        """Convert user to dictionary"""
-        return {
-            'id': self.id,
-            'email': self.email,
-            'first_name': self.first_name,
-            'last_name': self.last_name,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
-        }
-
-class BloodPressureReading(db.Model):
-    __tablename__ = 'blood_pressure_readings'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    systolic = db.Column(db.Integer, nullable=False)
-    diastolic = db.Column(db.Integer, nullable=False)
-    pulse = db.Column(db.Integer, nullable=False)
-    category = db.Column(db.String(20), nullable=False)
-    notes = db.Column(db.Text, nullable=True)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    def categorize_reading(self):
-        """Automatically categorize blood pressure reading"""
-        if self.systolic >= 180 or self.diastolic >= 120:
-            return 'Crisis'
-        elif self.systolic >= 140 or self.diastolic >= 90:
-            return 'Stage 2'
-        elif self.systolic >= 130 or self.diastolic >= 80:
-            return 'Stage 1'
-        elif self.systolic >= 120 and self.diastolic < 80:
-            return 'Elevated'
-        else:
-            return 'Normal'
-    
-    def to_dict(self):
-        """Convert reading to dictionary"""
-        return {
-            'id': self.id,
-            'user_id': self.user_id,
-            'systolic': self.systolic,
-            'diastolic': self.diastolic,
-            'pulse': self.pulse,
-            'category': self.category,
-            'notes': self.notes,
-            'timestamp': self.timestamp.isoformat(),
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
-        }
 
 # Utility functions
 def validate_email(email):
@@ -121,21 +49,6 @@ def validate_password(password):
     if not re.search(r'\d', password):
         return False, "Password must contain at least one number"
     return True, "Password is valid"
-
-def validate_bp_reading(systolic, diastolic, pulse):
-    """Validate blood pressure reading values"""
-    errors = []
-    
-    if not (60 <= systolic <= 300):
-        errors.append("Systolic pressure must be between 60 and 300 mmHg")
-    if not (30 <= diastolic <= 200):
-        errors.append("Diastolic pressure must be between 30 and 200 mmHg")
-    if not (30 <= pulse <= 220):
-        errors.append("Pulse rate must be between 30 and 220 BPM")
-    if systolic <= diastolic:
-        errors.append("Systolic pressure must be higher than diastolic pressure")
-    
-    return len(errors) == 0, errors
 
 # Error handlers
 @app.errorhandler(400)
@@ -272,6 +185,36 @@ def get_profile():
     except Exception as e:
         return jsonify({'error': 'Failed to get profile', 'message': str(e)}), 500
 
+@app.route('/api/auth/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    """Update current user's profile"""
+    try:
+        current_user_id = get_jwt_identity()
+        user = User.query.get(current_user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        data = request.get_json()
+        
+        # Update profile
+        user.update_profile(
+            first_name=data.get('first_name'),
+            last_name=data.get('last_name')
+        )
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Profile updated successfully',
+            'user': user.to_dict()
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to update profile', 'message': str(e)}), 500
+
 # Blood Pressure Reading Routes
 @app.route('/api/readings', methods=['GET'])
 @jwt_required()
@@ -284,6 +227,7 @@ def get_readings():
         limit = request.args.get('limit', 50, type=int)
         offset = request.args.get('offset', 0, type=int)
         days = request.args.get('days', type=int)
+        include_category_info = request.args.get('include_category_info', 'false').lower() == 'true'
         
         # Base query
         query = BloodPressureReading.query.filter_by(user_id=current_user_id)
@@ -300,7 +244,7 @@ def get_readings():
         total_count = query.count()
         
         return jsonify({
-            'readings': [reading.to_dict() for reading in readings],
+            'readings': [reading.to_dict(include_category_info=include_category_info) for reading in readings],
             'total_count': total_count,
             'limit': limit,
             'offset': offset
@@ -323,38 +267,31 @@ def create_reading():
             if field not in data:
                 return jsonify({'error': f'{field} is required'}), 400
         
-        systolic = int(data['systolic'])
-        diastolic = int(data['diastolic'])
-        pulse = int(data['pulse'])
+        # Parse timestamp if provided
+        timestamp = None
+        if data.get('timestamp'):
+            timestamp = datetime.fromisoformat(data['timestamp'])
         
-        # Validate reading values
-        is_valid, errors = validate_bp_reading(systolic, diastolic, pulse)
-        if not is_valid:
-            return jsonify({'error': 'Invalid reading values', 'details': errors}), 400
-        
-        # Create new reading
-        reading = BloodPressureReading(
+        # Create reading using class method (includes validation)
+        reading = BloodPressureReading.create_reading(
             user_id=current_user_id,
-            systolic=systolic,
-            diastolic=diastolic,
-            pulse=pulse,
-            notes=data.get('notes', '').strip(),
-            timestamp=datetime.fromisoformat(data['timestamp']) if data.get('timestamp') else datetime.utcnow()
+            systolic=data['systolic'],
+            diastolic=data['diastolic'],
+            pulse=data['pulse'],
+            notes=data.get('notes', ''),
+            timestamp=timestamp
         )
-        
-        # Set category
-        reading.category = reading.categorize_reading()
         
         db.session.add(reading)
         db.session.commit()
         
         return jsonify({
             'message': 'Reading created successfully',
-            'reading': reading.to_dict()
+            'reading': reading.to_dict(include_category_info=True)
         }), 201
         
     except ValueError as e:
-        return jsonify({'error': 'Invalid data type', 'message': str(e)}), 400
+        return jsonify({'error': 'Invalid data', 'message': str(e)}), 400
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': 'Failed to create reading', 'message': str(e)}), 500
@@ -365,6 +302,7 @@ def get_reading(reading_id):
     """Get a specific reading"""
     try:
         current_user_id = get_jwt_identity()
+        include_category_info = request.args.get('include_category_info', 'false').lower() == 'true'
         
         reading = BloodPressureReading.query.filter_by(
             id=reading_id, 
@@ -375,7 +313,7 @@ def get_reading(reading_id):
             return jsonify({'error': 'Reading not found'}), 404
         
         return jsonify({
-            'reading': reading.to_dict()
+            'reading': reading.to_dict(include_category_info=include_category_info)
         }), 200
         
     except Exception as e:
@@ -398,35 +336,29 @@ def update_reading(reading_id):
         
         data = request.get_json()
         
-        # Update fields if provided
-        if 'systolic' in data:
-            reading.systolic = int(data['systolic'])
-        if 'diastolic' in data:
-            reading.diastolic = int(data['diastolic'])
-        if 'pulse' in data:
-            reading.pulse = int(data['pulse'])
-        if 'notes' in data:
-            reading.notes = data['notes'].strip()
+        # Parse timestamp if provided
+        timestamp = None
         if 'timestamp' in data:
-            reading.timestamp = datetime.fromisoformat(data['timestamp'])
+            timestamp = datetime.fromisoformat(data['timestamp'])
         
-        # Validate updated values
-        is_valid, errors = validate_bp_reading(reading.systolic, reading.diastolic, reading.pulse)
-        if not is_valid:
-            return jsonify({'error': 'Invalid reading values', 'details': errors}), 400
-        
-        # Recalculate category
-        reading.category = reading.categorize_reading()
+        # Update reading using model method
+        reading.update_reading(
+            systolic=data.get('systolic'),
+            diastolic=data.get('diastolic'),
+            pulse=data.get('pulse'),
+            notes=data.get('notes'),
+            timestamp=timestamp
+        )
         
         db.session.commit()
         
         return jsonify({
             'message': 'Reading updated successfully',
-            'reading': reading.to_dict()
+            'reading': reading.to_dict(include_category_info=True)
         }), 200
         
     except ValueError as e:
-        return jsonify({'error': 'Invalid data type', 'message': str(e)}), 400
+        return jsonify({'error': 'Invalid data', 'message': str(e)}), 400
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': 'Failed to update reading', 'message': str(e)}), 500
@@ -479,18 +411,25 @@ def get_analytics_summary():
                     'period_days': days,
                     'averages': {},
                     'category_distribution': {},
-                    'trends': {}
+                    'trends': {},
+                    'high_risk_readings': 0
                 }
             }), 200
         
+        # Calculate averages
         avg_systolic = sum(r.systolic for r in readings) / len(readings)
         avg_diastolic = sum(r.diastolic for r in readings) / len(readings)
         avg_pulse = sum(r.pulse for r in readings) / len(readings)
         
+        # Category distribution
         category_dist = {}
+        high_risk_count = 0
         for reading in readings:
             category_dist[reading.category] = category_dist.get(reading.category, 0) + 1
+            if reading.is_high_risk():
+                high_risk_count += 1
         
+        # Trends (if we have at least 2 readings)
         if len(readings) >= 2:
             first_reading = readings[-1]  # Oldest
             last_reading = readings[0]   # Newest
@@ -515,7 +454,8 @@ def get_analytics_summary():
                     'systolic_change': systolic_trend,
                     'diastolic_change': diastolic_trend,
                     'pulse_change': pulse_trend
-                }
+                },
+                'high_risk_readings': high_risk_count
             }
         }), 200
         
